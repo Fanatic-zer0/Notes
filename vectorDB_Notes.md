@@ -1,4 +1,4 @@
-# Vector Databases: Comprehensive Guide from Zero to Hero
+# Vector Databases: Comprehensive Guide
 
 ## Table of Contents
 1. [Foundational Concepts](#foundational-concepts)
