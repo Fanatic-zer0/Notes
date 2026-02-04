@@ -28,6 +28,7 @@ Natural Language Processing starts with converting raw text into structured data
 
 Tokenization is the process of splitting text into tokens (words, subwords, or characters). This is more complex than simple whitespace splitting.
 
+```python
 # Example: Different tokenization approaches
 text = "ChatGPT's capabilities are impressive!"
 
@@ -44,6 +45,7 @@ tokens = tokenizer.encode(text)
 # 3. Character-level tokenization
 char_tokens = list(text)
 # Output: ['C', 'h', 'a', 't', 'G', 'P', 'T', "'", 's', ...]
+```
 
 **Key Concepts:**
 
@@ -55,6 +57,7 @@ char_tokens = list(text)
 
 Both reduce words to base forms, but with different approaches:
 
+```python
 from nltk.stem import PorterStemmer, WordNetLemmatizer
 
 stemmer = PorterStemmer()
@@ -81,6 +84,7 @@ for word in words:
 # ran → run (understands past tense)
 # easily → easily (preserves adverbs)
 # fairly → fairly
+```
 
 **Differences:**
 
@@ -97,6 +101,7 @@ Embeddings convert discrete tokens into continuous vectors that capture semantic
 
 Word2Vec uses shallow neural networks to learn word representations by predicting context words.
 
+```python
 # Skip-gram model concept
 # Given: "The quick brown fox"
 # Predict surrounding words from each word
@@ -122,6 +127,7 @@ model = Word2Vec(
 # Access embeddings
 vector = model.wv["quick"]        # shape: (100,)
 similarity = model.wv.similarity("quick", "fast")  # cosine similarity
+```
 
 **Key metrics:**
 
@@ -133,6 +139,7 @@ similarity = model.wv.similarity("quick", "fast")  # cosine similarity
 
 GloVe combines global matrix factorization with local context windows:
 
+```python
 # GloVe doesn't require separate tokenization; it builds a co-occurrence matrix
 # and factorizes it to learn embeddings
 
@@ -158,6 +165,7 @@ man = embeddings_index['man']
 woman = embeddings_index['woman']
 queen_predicted = king - man + woman
 # Cosine similarity with actual queen is very high!
+```
 
 **Comparison with Word2Vec:**
 
@@ -172,6 +180,7 @@ queen_predicted = king - man + woman
 
 A neural network is a composition of functions that learns from data through gradient descent.
 
+```python
 # Simplified neural network forward pass
 import numpy as np
 
@@ -229,6 +238,7 @@ for epoch in range(100):
     if epoch % 20 == 0:
         loss = -np.mean(np.log(logits[np.arange(len(y_train)), y_train.argmax(axis=1)]))
         print(f"Epoch {epoch}, Loss: {loss:.4f}")
+```
 
 **Key concepts:**
 
@@ -241,6 +251,7 @@ for epoch in range(100):
 
 Different optimizers have different convergence properties:
 
+```python
 import torch
 import torch.optim as optim
 
@@ -289,6 +300,7 @@ for epoch in range(num_epochs):
         
         # Update weights
         optimizer.step()
+```
 
 **Comparison:**
 
@@ -303,6 +315,7 @@ AdamW      | Fast        | Medium | Better         | LLM training (preferred)
 
 Cross-entropy is the standard loss for predicting probability distributions:
 
+```python
 import torch.nn.functional as F
 
 # Language modeling task: predict next token
@@ -324,6 +337,7 @@ loss = F.cross_entropy(
 # Measures how "surprised" the model is on test data
 # Lower is better. Perplexity of 10 = model thinks test data is ~10x more likely
 perplexity = torch.exp(loss)
+```
 
 ### Sequential Models: RNNs, LSTMs, and GRUs
 
@@ -333,6 +347,7 @@ Before Transformers, sequential models processed text one token at a time with h
 
 RNNs maintain a hidden state that gets updated at each timestep:
 
+```python
 import torch
 import torch.nn as nn
 
@@ -383,6 +398,7 @@ When backpropagating through many timesteps, gradients get multiplied repeatedly
 
 LSTMs solve the vanishing gradient problem with gating mechanisms:
 
+```python
 class LSTMCell(nn.Module):
     """Single LSTM cell"""
     def __init__(self, input_size, hidden_size):
@@ -430,6 +446,7 @@ class LSTMCell(nn.Module):
 - **Forget gate** controls what information to keep (f_t ∈ [0,1] usually > 0.5)
 - **Gradients** can flow unchanged through cell state: ∂c_T/∂c_t involves products of values close to 1
 
+```python
 # PyTorch's built-in LSTM
 lstm = nn.LSTM(
     input_size=100,
@@ -443,11 +460,13 @@ outputs, (h_n, c_n) = lstm(x)
 # outputs: (batch, seq, hidden_size) - all hidden states
 # h_n: final hidden state
 # c_n: final cell state
+```
 
 #### Gated Recurrent Unit (GRU)
 
 GRUs are a simpler variant of LSTMs with fewer gates:
 
+```python
 # GRU equations (simplified LSTM)
 # Reset gate: r_t = σ(W_r [h_{t-1}, x_t])
 # Update gate: z_t = σ(W_z [h_{t-1}, x_t])
@@ -462,6 +481,7 @@ gru = nn.GRU(
 )
 
 outputs, h_n = gru(x)
+```
 
 **Comparison:**
 
@@ -490,6 +510,7 @@ Attention allows the model to focus on relevant parts of the input regardless of
 
 #### Scaled Dot-Product Attention
 
+```python
 import torch
 import torch.nn as nn
 import math
@@ -529,6 +550,7 @@ V = torch.randn(1, seq_len, d_model)  # values
 
 output, weights = scaled_dot_product_attention(Q, K, V)
 # weights shape: (1, 4, 4) - attention from each token to all tokens
+```
 
 **Why scale by √d_k?**
 
@@ -540,6 +562,7 @@ output, weights = scaled_dot_product_attention(Q, K, V)
 
 Instead of computing attention once, compute it multiple times in parallel with different subspaces:
 
+```python
 class MultiHeadAttention(nn.Module):
     def __init__(self, d_model, num_heads):
         super().__init__()
@@ -591,6 +614,7 @@ mha = MultiHeadAttention(d_model=512, num_heads=8)
 x = torch.randn(batch_size=32, seq_len=100, d_model=512)
 output, weights = mha(x, x, x)  # Self-attention: Q=K=V=x
 # Each head operates on 512/8 = 64-dimensional subspace
+```
 
 **Benefits of multi-head attention:**
 
@@ -600,6 +624,7 @@ output, weights = mha(x, x, x)  # Self-attention: Q=K=V=x
 
 ### The Transformer Block: Self-Attention + FFN
 
+```python
 class TransformerBlock(nn.Module):
     def __init__(self, d_model, num_heads, d_ff, dropout=0.1):
         super().__init__()
@@ -647,6 +672,7 @@ class Transformer(nn.Module):
         for layer in self.layers:
             x = layer(x, mask)
         return x
+```
 
 ### Positional Encoding: Injecting Position Information
 
@@ -654,6 +680,7 @@ Attention doesn't have inherent position awareness. We must add position informa
 
 #### Sinusoidal Positional Encoding (Transformers)
 
+```python
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_seq_length=5000):
         super().__init__()
