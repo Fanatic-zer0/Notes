@@ -42,8 +42,10 @@ Kubernetes storage provides **persistent data** beyond a pod's lifetime. The sto
 | `secret` | Until deleted | Cluster | Sensitive config |
 | `persistentVolumeClaim` | Persistent | Cluster | Databases, app state |
 | `nfs` | Persistent | External | Shared access |
-| `awsElasticBlockStore` | Persistent | AWS | EBS volumes |
-| `gcePersistentDisk` | Persistent | GCP | Persistent Disk |
+| `awsElasticBlockStore` | Persistent | AWS | **Deprecated** — use `ebs.csi.aws.com` CSI |
+| `gcePersistentDisk` | Persistent | GCP | **Deprecated** — use `pd.csi.storage.gke.io` CSI |
+
+> The in-tree plugins `awsElasticBlockStore`, `gcePersistentDisk`, `azureDisk`, and similar were removed or locked in Kubernetes 1.29+. All new storage integrations use CSI drivers. Use the CSI-based StorageClass (shown in the Dynamic Provisioning section below) for all production workloads.
 
 ## Static Provisioning Flow
 
@@ -494,3 +496,7 @@ kubectl get csinodes
 kubectl get events --field-selector reason=ProvisioningSucceeded
 kubectl get events --field-selector reason=ProvisioningFailed
 ```
+
+---
+
+**Next:** [ConfigMaps & Secrets](07-configmaps-secrets.md)
