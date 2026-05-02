@@ -54,11 +54,11 @@ All Nodes: [Node1, Node2, Node3, Node4, Node5]
 ```
 Feasible Nodes: [Node1, Node2]
      │
-     ├─→ LeastAllocated: Prefer nodes with less resource usage
+     ├─→ NodeResourcesFit (LeastAllocated strategy): Prefer nodes with less resource usage
      │       Node1: CPU 20%, Mem 30% → Score: 75
      │       Node2: CPU 60%, Mem 70% → Score: 35
      │
-     ├─→ SelectorSpread: Prefer nodes with fewer same-label pods
+     ├─→ PodTopologySpread: Prefer nodes that achieve even pod spread
      │       Node1: 0 backend pods → +10
      │       Node2: 2 backend pods → +0
      │
@@ -72,6 +72,8 @@ Feasible Nodes: [Node1, Node2]
               Node2: 40
               Scheduler binds pod to Node1
 ```
+
+> **Plugin names:** `LeastAllocated` and `MostAllocated` are scoring *strategies* within the `NodeResourcesFit` plugin (configured via `KubeSchedulerConfiguration`). `SelectorSpread` was the old name for per-node pod spreading; modern clusters use `PodTopologySpread` instead.
 
 ## Node Selection Methods
 
@@ -527,3 +529,7 @@ kubectl get pods -n kube-system | grep scheduler
 # View scheduler logs
 kubectl logs -n kube-system kube-scheduler-controlplane
 ```
+
+---
+
+**Next:** [Autoscaling](10-autoscaling.md)
