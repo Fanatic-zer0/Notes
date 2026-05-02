@@ -154,13 +154,15 @@ Ingress is just a **specification**. You need an **Ingress Controller** to imple
 
 | Controller | Maintainer | Features | Use Case |
 |------------|------------|----------|----------|
-| **nginx-ingress** | Kubernetes | Full-featured, mature | General purpose |
-| **ingress-nginx** | NGINX Inc | Enterprise features | Production |
+| **ingress-nginx** | Kubernetes community | Full-featured, widely adopted OSS | General purpose (most common) |
+| **nginx-ingress** | NGINX Inc | Enterprise NGINX Plus features | Commercial/Enterprise |
 | **Traefik** | Traefik Labs | Auto-discovery, dashboard | Microservices |
 | **HAProxy** | HAProxy | High performance | High traffic |
 | **Istio Gateway** | Istio | Service mesh integration | Advanced routing |
 | **AWS ALB** | AWS | Native AWS integration | EKS clusters |
 | **Contour** | VMware | Envoy-based | Cloud-native |
+
+> **ingress-nginx vs nginx-ingress:** These are two distinct controllers. `ingress-nginx` (registry: `registry.k8s.io/ingress-nginx/controller`) is the Kubernetes community project and the most widely deployed. `nginx-ingress` (Nginx Inc) is the commercial/enterprise offering. They share similar annotation syntax but differ in defaults and paid features.
 
 ### NGINX Ingress Controller Deployment
 
@@ -519,3 +521,5 @@ metadata:
 ```
 
 ---
+
+**Next:** [DNS Resolution](04-dns-resolution.md)
