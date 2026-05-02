@@ -386,20 +386,20 @@ Headers:
 │ GATEWAY ROUTE MATCHING LOGIC                        │
 ├─────────────────────────────────────────────────────┤
 │                                                     │
-│ 1. Evaluate Rule 1 (beta + feature flag):           │
-│    ┌─ Match header X-User-Group: beta               │
-│    │   Request has: "beta" ✅                       │
+│ 1. Evaluate Rule 1 (beta + feature flag):         │
+│    ┌─ Match header X-User-Group: beta             │
+│    │   Request has: "beta" ✅                      │
 │    │                                                │
-│    └─ Match header X-Feature-Flag: "new-ui"         │
-│       Request has: "new-ui" ✅                      │
+│    └─ Match header X-Feature-Flag: "new-ui"       │
+│       Request has: "new-ui" ✅                     │
 │                                                     │
-│    Both conditions match!                           │
-│    ✅ Route to: api-service-v2:8080                 │
-│    ❌ Skip remaining rules                          │
+│    Both conditions match!                          │
+│    ✅ Route to: api-service-v2:8080                │
+│    ❌ Skip remaining rules                         │
 │                                                     │
-│ 2. (Not evaluated - already matched)                │
+│ 2. (Not evaluated - already matched)              │
 │                                                     │
-│ 3. (Not evaluated - already matched)                │
+│ 3. (Not evaluated - already matched)              │
 └─────────────────────────────────────────────────────┘
          │
          └─→ Forward to api-service-v2
@@ -1082,3 +1082,7 @@ Jaeger/Zipkin visualizes complete trace
 5. **Request timeouts** - always set timeouts at gateway
 6. **API Documentation** - Use Swagger/OpenAPI spec with gateway
 7. **Monitor latency at each hop** - Gateway, service, database separately
+
+---
+
+**Next:** [Admission Controllers & Webhooks](13-admission-controllers.md)
