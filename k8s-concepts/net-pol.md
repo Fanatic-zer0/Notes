@@ -740,3 +740,6 @@ calicoctl get globalnetworkpolicy --output=yaml
 
 8. **Use least privilege** - only allow required connections
 
+---
+
+**Next:** [Storage & Volumes](06-storage-volumes.md)
