@@ -12,9 +12,6 @@ At a high level:
 
 ## Architecture Overview
 
-<img width="790" height="793" alt="image" src="https://github.com/user-attachments/assets/15ad555f-27b1-4f7e-b761-0361b243d152" />
-
-
 ```mermaid
 flowchart LR
 		subgraph Clients
@@ -111,8 +108,6 @@ flowchart LR
 6. Storage layer code maps the object to an etcd path such as `/registry/pods/default/my-pod`.
 7. The API server writes through its storage backend to etcd, then returns the persisted object with `metadata.resourceVersion`.
 8. Watch cache and storage watchers fan out change notifications to connected watchers.
-
-<img width="831" height="980" alt="image" src="https://github.com/user-attachments/assets/a1af8f28-8575-43fe-bdc8-452b3a692b2d" />
 
 
 ```mermaid
@@ -514,10 +509,6 @@ Kubernetes uses a declarative reconciliation model rather than an imperative exe
 
 ### End-to-End Reconciliation Loop
 
-
-<img width="1253" height="405" alt="image" src="https://github.com/user-attachments/assets/821f7fc2-afb8-4562-b6d1-7a84ebdc9aa0" />
-
-
 ```mermaid
 flowchart LR
 		A[Desired State in YAML] --> B[kubectl / client-go]
@@ -570,11 +561,6 @@ There is no single global interval; different loops have different timings.
 - This makes controllers eventually consistent on their local caches, while the API persists the authoritative state.
 
 ### Informer / Reflector Lifecycle
-
-
-<img width="1253" height="405" alt="image" src="https://github.com/user-attachments/assets/1f8e3498-9c8d-4485-91b8-253bd90dbe0f" />
-
-
 
 ```mermaid
 flowchart LR
