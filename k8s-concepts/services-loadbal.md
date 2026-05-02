@@ -54,10 +54,12 @@ spec:
 
 ### How It Works
 1. **Service created** → kube-apiserver stores in etcd
-2. **Endpoints controller** watches Service, finds matching pods by selector
-3. **Creates Endpoints object** with pod IPs: `[10.244.1.8:8080, 10.244.2.9:8080]`
-4. **kube-proxy** (on every node) watches Service/Endpoints
+2. **EndpointSlice controller** watches the Service and matching pods by selector
+3. **Creates EndpointSlice object** with pod IPs: `[10.244.1.8:8080, 10.244.2.9:8080]`
+4. **kube-proxy** (on every node) watches Service/EndpointSlice
 5. **Configures iptables/IPVS** rules to forward ClusterIP traffic to pod IPs
+
+> **Note:** Kubernetes 1.21+ uses `EndpointSlice` objects (replacing the older `Endpoints` object). EndpointSlices partition backends across multiple objects for scalability. The old `Endpoints` API still exists for compatibility but EndpointSlice is the data plane truth.
 
 ## NodePort Service
 
@@ -381,11 +383,14 @@ nslookup database-headless.default.svc.cluster.local
 2. **externalTrafficPolicy: Local** for latency-sensitive apps
 3. **Session affinity** for stateful applications
 4. **Headless services** for databases and StatefulSets
-5. **Topology-aware routing** (topologyKeys) for multi-zone clusters
+5. **Topology-aware routing** via EndpointSlice topology hints (`hints.forZones`) for multi-zone clusters — note: the old `topologyKeys` field was removed in Kubernetes 1.27
 
 ### Monitoring
 ```bash
-# Check service endpoints
+# Check service endpoint slices (modern)
+kubectl get endpointslices -l kubernetes.io/service-name=backend-service
+
+# Legacy endpoints view (still works)
 kubectl get endpoints backend-service
 
 # View kube-proxy logs
