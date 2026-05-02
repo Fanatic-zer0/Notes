@@ -16,7 +16,7 @@ Pod wants to reach "backend-service"
      │       backend-service.default.svc.cluster.local
      │
      ├─→ 3. CoreDNS looks up in cluster database
-     │       Queries kube-apiserver for Service info
+     │       Answers from in-memory cache (populated via LIST/WATCH on Services)
      │
      ├─→ 4. Returns Service ClusterIP or Pod IPs
      │       10.96.20.30 (for ClusterIP service)
@@ -187,17 +187,22 @@ These persist even if pods are rescheduled!
                     ↓
 ┌────────────────────────────────────────────────────────────────┐
 │ CoreDNS Corefile Processing                                    │
+│ (CoreDNS maintains a watch-driven in-memory cache of all       │
+│  services and pods; DNS queries are answered from cache, NOT   │
+│  by calling kube-apiserver on each request)                    │
 │   ┌────────────────────────────────────────────────────────┐  │
 │   │ kubernetes plugin                                      │  │
 │   │ - Matches *.cluster.local                             │  │
-│   │ - Queries kube-apiserver                              │  │
-│   │ - GET /api/v1/namespaces/default/services/api-service │  │
+│   │ - Serves from in-memory cache (NOT a per-request      │  │
+│   │   API call to kube-apiserver)                         │  │
+│   │ - Cache is populated via LIST/WATCH on Services,      │  │
+│   │   Endpoints/EndpointSlices, Pods, and Namespaces      │  │
 │   └────────────────────────────────────────────────────────┘  │
 └───────────────────┬────────────────────────────────────────────┘
                     │ 5. API Server response
                     ↓
 ┌────────────────────────────────────────────────────────────────┐
-│ Service Object (from etcd)                                     │
+│ Service Object (from CoreDNS in-memory cache, not etcd direct) │
 │   Name: api-service                                            │
 │   Namespace: default                                           │
 │   ClusterIP: 10.96.20.30                                       │
