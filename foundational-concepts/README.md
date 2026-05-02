@@ -29,25 +29,58 @@ Before diving into Kubernetes, understanding these foundational concepts is **ab
 
 ### Real-World Example: What Happens When You Create a Pod
 
-```
-kubectl create -f pod.yaml
-         │
-         ├─→ API Server receives request (REST API)
-         │   Validates YAML syntax
-         │
-         ├─→ Scheduler assigns to Node
-         │
-         ├─→ Kubelet on Node starts container
-         │   │
-         │   ├─→ Creates Linux Namespaces (PID, NET, MNT, UTS, IPC)
-         │   ├─→ Applies cgroup limits (CPU, Memory)
-         │   ├─→ Creates veth pair (virtual ethernet)
-         │   ├─→ Configures iptables rules for Service
-         │   ├─→ Pulls container image (understand layers!)
-         │   ├─→ Creates overlay filesystem (image layers)
-         │   └─→ Starts process in isolated environment
-         │
-         └─→ Pod is Running!
+```mermaid
+sequenceDiagram
+    actor User
+    participant API as kube-apiserver
+    participant etcd as etcd
+    participant Sched as kube-scheduler
+    participant KCM as kube-controller-manager
+    participant Kubelet as kubelet (node)
+    participant CRI as CRI runtime (containerd)
+    participant CNI as CNI plugin
+    participant Kernel as Linux Kernel
+
+    User->>API: kubectl apply -f pod.yaml
+    Note over API: AuthN → AuthZ → Admission → Schema validation
+
+    API->>etcd: Persist Pod object (spec.nodeName = "")
+    etcd-->>API: Stored, resourceVersion=N
+
+    API-->>Sched: Watch event: new unscheduled Pod
+    Note over Sched: Filter nodes (resources, taints, affinity)<br/>Score nodes (balance, locality)<br/>Select best node
+    Sched->>API: POST /binding → spec.nodeName = node-1
+    API->>etcd: Update Pod with nodeName=node-1
+
+    API-->>Kubelet: Watch event: Pod bound to this node
+    Note over Kubelet: Resolves Secrets, ConfigMaps<br/>Mounts projected service account token
+
+    Kubelet->>CRI: RunPodSandbox (pause container)
+    CRI->>Kernel: clone(CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC)
+    Note over Kernel: New Linux namespaces created:<br/>PID, NET, MNT, UTS, IPC
+
+    CRI->>CNI: ADD — set up pod network
+    CNI->>Kernel: Create veth pair (eth0 ↔ cali/veth on host bridge)
+    CNI->>Kernel: Assign Pod IP from CIDR, set default route
+    CNI-->>CRI: Pod IP allocated (e.g. 10.244.1.42)
+
+    Kubelet->>CRI: PullImage (if not cached)
+    Note over CRI: Fetch OCI image layers from registry<br/>Decompress + store via snapshotter (overlayfs)
+
+    CRI->>Kernel: Mount overlay filesystem (lowerdir=image layers, upperdir=writable layer)
+    CRI->>Kernel: Apply cgroup limits (cpu.max, memory.max, blkio)
+    Note over Kernel: cgroup v2 hierarchy enforces<br/>CPU shares, memory limit, OOM policy
+
+    CRI->>CRI: CreateContainer → StartContainer
+    Note over CRI: execve() in new namespaces<br/>PID 1 = container entrypoint
+
+    Kubelet->>API: PATCH Pod/status → phase=Running, podIP, containerStatuses
+    API->>etcd: Persist status
+
+    Note over KCM: EndpointSlice controller sees Ready Pod<br/>Updates EndpointSlice for matching Services
+    KCM->>API: PATCH EndpointSlice — add pod IP:port
+
+    Note over Kubelet: kube-proxy watches Service + EndpointSlice<br/>Programs iptables DNAT rules on node
 ```
 
 **Without understanding these foundations, you won't know:**
@@ -223,3 +256,8 @@ After mastering these foundations:
 4. Experiment with different CNI plugins
 5. Explore kube-proxy modes (iptables vs IPVS)
 
+---
+
+**Start with:** [01-linux-fundamentals.md](01-linux-fundamentals.md)
+
+**Questions or stuck?** Understanding these foundations takes time. Don't rush - these concepts are used everywhere in Kubernetes!
