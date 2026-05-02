@@ -508,3 +508,6 @@ kubectl exec pod-name -- cat /etc/config/APP_ENV  # For volume mounts, should up
 kubectl describe pod my-pod  # Check volume mount permissions
 ```
 
+---
+
+**Next:** [Pod Lifecycle](08-pod-lifecycle.md)
