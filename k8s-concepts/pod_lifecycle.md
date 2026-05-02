@@ -506,3 +506,6 @@ spec:
     emptyDir: {}
 ```
 
+---
+
+**Next:** [Pod Scheduling](09-pod-scheduling.md)
