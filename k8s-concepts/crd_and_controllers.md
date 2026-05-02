@@ -1334,3 +1334,6 @@ kubectl get events --field-selector involvedObject.kind=Database
 kubectl get databases -A
 ```
 
+---
+
+**Next:** [API Gateway Patterns](12-api-gateway.md)
