@@ -387,6 +387,302 @@ flowchart LR
                    Total: ~48ms
 ```
 
+---
+
+## API Gateway Internals
+
+### 1. Config Translation: HTTPRoute → Proxy Config
+
+The controller continuously watches the Kubernetes API and translates declarative objects into the proxy's native config format. No config change touches the proxy directly — everything goes through the controller's translation engine.
+
+```mermaid
+flowchart TD
+    subgraph K8sObjects["Kubernetes Config Objects (stored in etcd)"]
+        GWClass["GatewayClass\ncontrollerName: konghq.com/kic"]
+        GW["Gateway\nlisteners:\n  port: 443, HTTPS\n  tls: Secret/gateway-tls\n  allowedRoutes: ns selector"]
+        RouteA["HTTPRoute — team-a\nhost: api.example.com\n/v1/users → user-service:8080\n/v1/users/profile → user-svc-v2:8080\nfilter: strip /v1 prefix"]
+        RouteB["HTTPRoute — team-b\nhost: api.example.com\n/v1/orders → order-service:8080\ncanary weight: v1=90 v2=10"]
+        EPSlice["EndpointSlice\nuser-service:\n  10.244.1.10:8080 ready=true\n  10.244.2.15:8080 ready=true\n  10.244.3.10:8080 ready=false ← excluded"]
+        TLSSecret["Secret/gateway-tls\ntls.crt: <PEM cert chain>\ntls.key: <PEM private key>"]
+    end
+
+    subgraph Controller["Gateway Controller (e.g. Kong KIC)"]
+        Watch["Informer / Reflector\nLIST+WATCH all Gateway API types\n+ EndpointSlices + Secrets"]
+        Validate["Validation\nparentRef resolves to allowed Gateway?\nNamespace has gateway-access label?\nBackend Service exists?"]
+        Translate["Translation Engine\nHTTPRoute rules → upstream + route objects\nTLS Secret → cert PEM bytes\nEndpointSlice ready addrs → upstream targets\nFilters → plugin config"]
+        Diff["Diff Engine\nCompare desired config vs current proxy state\nOnly push deltas — avoid unnecessary reloads"]
+        StatusPatch["PATCH status back to API server\nHTTPRoute: ResolvedRefs=True\nGateway: Ready=True, externalIP assigned"]
+    end
+
+    subgraph ProxyConfig["Kong Proxy State (via Admin API / xDS)"]
+        UpstreamObj["Upstream\nname: user-service.production\nalgorithm: round-robin\ntargets:\n  10.244.1.10:8080 weight=100\n  10.244.2.15:8080 weight=100"]
+        RouteObj["Route\nhosts: [api.example.com]\npaths: [/v1/users]\nstrip_path: true\nplugins: rate-limit, jwt, req-xfm"]
+        ServiceObj["Service\nname: user-service\nprotocol: http\nupstream: user-service.production"]
+        CertObj["Certificate\ncert: <PEM>\nkey: <PEM>\nsnis: [api.example.com]"]
+    end
+
+    K8sObjects --> Watch
+    Watch --> Validate
+    Validate --> Translate
+    Translate --> Diff
+    Diff -->|"POST/PATCH Admin API\nor xDS snapshot push"| ProxyConfig
+    Diff --> StatusPatch
+```
+
+**Translation table — what each K8s object becomes in the proxy:**
+
+| K8s Object | Proxy Equivalent | Key decisions made |
+| --- | --- | --- |
+| `GatewayClass` | Proxy process config, admin API settings | Validates `controllerName` matches this controller only |
+| `Gateway` listener | Proxy listen port + TLS cert binding | Reads Secret, decodes PEM, maps SNI → cert |
+| `HTTPRoute` rule | Route: host + path + header match conditions | Evaluates match specificity order, most specific wins |
+| `HTTPRoute` filter | Plugin config attached to route | `RequestHeaderModifier` → request-transformer plugin config |
+| `HTTPRoute` backendRef | Upstream target group | Resolves Service → EndpointSlice → live Pod IPs with `ready=true` |
+| `HTTPRoute` weights | Upstream target weights | `v1 weight=90, v2 weight=10` → two upstreams + weighted balancer |
+| `EndpointSlice` address | Upstream target | Only `conditions.ready=true` addresses included |
+| `Secret` (TLS) | Certificate object + SNI mapping | PEM decode, validates cert chain expiry |
+
+---
+
+### 2. Internal Request Processing Pipeline
+
+Inside the gateway pod, every request travels through a **phase-based pipeline**. Each phase is a hook point where plugins can read, modify, or short-circuit the request. Phases run in a fixed order — a plugin cannot run in `log` phase before `access` phase.
+
+```mermaid
+flowchart TD
+    TCP["TCP Accept\nTLS ClientHello received"]
+
+    subgraph Pipeline["Phase Pipeline — runs per request"]
+        Ph_cert["Phase: certificate\nSNI lookup → select TLS cert\nOptional: verify client mTLS cert\nPlugin hook: custom cert selection logic"]
+
+        Ph_rewrite["Phase: rewrite\nEarly path/method rewriting\nBefore route matching\nPlugin hook: path normalization, redirects"]
+
+        Ph_access["Phase: access\n★ Most plugins run here ★\n• Rate limiting (check + increment counter)\n• JWT / API key authentication\n• IP allow/deny\n• Request size limits\n• Request validation\nPlugin hook: return 4xx to short-circuit"]
+
+        Ph_balancer["Phase: balancer\nUpstream target selection\nHealth-aware load balancing\nRetry on connection failure\nPlugin hook: custom LB algorithm"]
+
+        Ph_upstream["Forward request to selected Pod IP\nUse pooled TCP connection if available\nApply upstream timeout"]
+
+        Ph_header["Phase: header_filter\nModify response headers before body\nAdd CORS, HSTS, security headers\nRemove internal headers (Server, X-Powered-By)\nPlugin hook: runs before body is streamed"]
+
+        Ph_body["Phase: body_filter\nResponse body transformation\nGzip compression / decompression\nResponse caching (store in memory/Redis)\nPlugin hook: can buffer or stream body"]
+
+        Ph_log["Phase: log\nNon-blocking — runs AFTER response sent\nWrite access log entry\nEmit Prometheus counter/histogram\nSend OpenTelemetry span to collector\nAudit trail write"]
+    end
+
+    Reject["Return 4xx / 5xx immediately\nRequest never reaches upstream\n(rate limit, auth failure, etc.)"]
+
+    TCP --> Ph_cert --> Ph_rewrite --> Ph_access
+    Ph_access -->|"plugin short-circuits"| Reject
+    Ph_access -->|"all plugins passed"| Ph_balancer
+    Ph_balancer --> Ph_upstream
+    Ph_upstream --> Ph_header --> Ph_body --> Ph_log
+```
+
+**Why phase placement of plugins matters:**
+
+| Plugin | Phase | Reason |
+| --- | --- | --- |
+| Rate limiting | `access` | Must reject before touching upstream — saves backend resources |
+| JWT auth | `access` | Must reject unauthenticated requests before forwarding |
+| Request ID injection | `rewrite` | Must be set before route matching so it appears in logs |
+| CORS headers | `header_filter` | Added to response, not request — runs after backend replies |
+| Gzip compression | `body_filter` | Operates on response body stream |
+| Prometheus metrics | `log` | Non-blocking — does not add latency to the client response |
+
+---
+
+### 3. Upstream Connection Pool
+
+The gateway does **not** open a new TCP connection to a backend Pod for every request. It maintains a **per-target connection pool** — connections are reused across requests.
+
+```mermaid
+flowchart LR
+    subgraph GWPod["Kong Gateway Pod (10.244.0.5)"]
+        Req["Incoming request\nrouted to user-service"]
+        Pool1{{"Connection pool\n10.244.1.10:8080\nidle: 3 / max: 60"}}
+        Pool2{{"Connection pool\n10.244.2.15:8080\nidle: 0 / max: 60"}}
+        Pool3{{"Connection pool\n10.244.3.10:8080\nhealth: FAILED\nCircuit: OPEN"}}
+        NewConn["Open new TCP connection\n(3-way handshake ~1ms)"]
+        ReuseConn["Reuse idle keepalive\nconnection (0ms overhead)"]
+        CB["Circuit breaker\nOPEN: fail immediately\nHALF-OPEN: allow 1 probe\nCLOSED: normal operation"]
+    end
+
+    subgraph Backends["Backend Pods"]
+        P1["10.244.1.10:8080"]
+        P2["10.244.2.15:8080"]
+        P3["10.244.3.10:8080\n(unhealthy)"]
+    end
+
+    Req -->|"round-robin selects P1"| Pool1
+    Pool1 -->|"idle conn available"| ReuseConn
+    ReuseConn --> P1
+
+    Req -->|"round-robin selects P2"| Pool2
+    Pool2 -->|"pool empty, not full"| NewConn
+    NewConn --> P2
+
+    Req -->|"round-robin selects P3"| Pool3
+    Pool3 --> CB
+    CB -->|"OPEN — skip P3, retry next target"| Req
+
+    P1 -->|"response → return conn to pool"| Pool1
+    P2 -->|"response → return conn to pool"| Pool2
+```
+
+**Circuit breaker state machine:**
+
+```
+         ┌─────────────────────────────────────────────────────────┐
+         │                                                         │
+    CLOSED (normal)                                               │
+    All requests pass through                                     │
+         │                                                         │
+         │  N consecutive failures (e.g. 5 timeouts or 5xx)       │
+         ▼                                                         │
+    OPEN (fail fast)                                              │
+    Reject immediately — no connection attempt                    │
+    Wait T seconds (e.g. 30s)                                    │
+         │                                                         │
+         │  After timeout                                          │
+         ▼                                                         │
+    HALF-OPEN (probe)                                             │
+    Allow 1 request through as a health probe                    │
+         │                          │                              │
+    Probe succeeds            Probe fails                         │
+         │                          │                              │
+         └──────── CLOSED ◄─────────┘                              │
+                                    └────────────── OPEN ──────────┘
+```
+
+---
+
+### 4. Endpoint Discovery: How the Gateway Tracks Live Pod IPs
+
+The gateway never queries DNS per request. It maintains a live table of ready Pod IPs sourced from **EndpointSlices**, updated in near-real-time as Pods start and stop passing their readiness probes.
+
+```mermaid
+sequenceDiagram
+    participant Kubelet as kubelet
+    participant API as kube-apiserver
+    participant ESCtrl as EndpointSlice controller
+    participant KIC as Gateway Controller
+    participant Kong as Kong Proxy
+
+    Note over Kubelet: Pod readinessProbe passes
+    Kubelet->>API: PATCH Pod/status\nconditions: Ready=True
+
+    API-->>ESCtrl: WATCH event: Pod MODIFIED
+    ESCtrl->>API: PATCH EndpointSlice\nadd 10.244.2.15:8080\nconditions.ready=true
+
+    API-->>KIC: WATCH event: EndpointSlice MODIFIED
+    KIC->>KIC: Recompute upstream targets\nuser-service.production:\n  10.244.1.10:8080 ✅\n  10.244.2.15:8080 ✅ ← new\n  10.244.3.10:8080 ❌ ready=false
+
+    KIC->>Kong: Admin API POST\n/upstreams/user-service.production/targets\n{ "target": "10.244.2.15:8080", "weight": 100 }
+    Note over Kong: New target added\nNext round-robin cycle includes it
+
+    Note over Kubelet: Pod readinessProbe fails
+    Kubelet->>API: PATCH Pod/status\nconditions: Ready=False
+
+    API-->>ESCtrl: WATCH event: Pod MODIFIED
+    ESCtrl->>API: PATCH EndpointSlice\n10.244.2.15:8080 conditions.ready=false
+
+    API-->>KIC: WATCH event: EndpointSlice MODIFIED
+    KIC->>Kong: Admin API DELETE\n/upstreams/user-service.production/targets/10.244.2.15:8080
+    Note over Kong: Target removed\nIn-flight requests complete\nNew requests skip this pod
+```
+
+**Two layers of Pod health — both must pass:**
+
+| Layer | Mechanism | Enforced by | Effect on traffic |
+| --- | --- | --- | --- |
+| Kubernetes readiness | readinessProbe (HTTP/TCP/exec) | kubelet → EndpointSlice controller | Removes pod from EndpointSlice → controller removes from upstream |
+| Gateway active health | Periodic HTTP/TCP probe from gateway | Gateway upstream health checker | Removes target from connection pool independently |
+| Gateway passive health | Count 5xx / timeouts on live traffic | Circuit breaker per target | Opens circuit, stops sending, probes to recover |
+
+A Pod can fail only at one layer — for example it passes readiness but its HTTP responses are returning 500s. The gateway's passive health check catches this and opens the circuit even though the EndpointSlice still lists it as ready.
+
+---
+
+### 5. TLS Termination Internals
+
+The gateway handles all TLS negotiation with external clients. Backends typically receive plain HTTP within the cluster network.
+
+```mermaid
+flowchart TD
+    Client["Client sends TLS ClientHello\nSNI extension: api.example.com\nSupported: TLS 1.3, 1.2\nCipherSuites: AES-256-GCM-SHA384\nAES-128-GCM-SHA256, ChaCha20-Poly1305"]
+
+    SNI["Gateway TLS stack\nExtract SNI from ClientHello\nbefore decryption — SNI is plaintext"]
+
+    CertLookup["Certificate store\n(built from Kubernetes Secrets)\n─────────────────────────────\napi.example.com       → cert-A (exact match ✅)\n*.internal.example.com → cert-B (wildcard)\nDefault fallback       → cert-C"]
+
+    Handshake["TLS 1.3 Handshake\n① Server → Certificate + CertificateVerify\n② Client verifies cert chain against trust store\n③ ECDH key exchange (X25519)\n④ Both sides derive session keys\n⑤ Finished messages — encrypted channel established"]
+
+    HTTP["Plaintext HTTP/1.1 or HTTP/2\nGateway can now read headers, path, body"]
+
+    BackendHTTP["Plain HTTP to backend Pod\nNo TLS overhead within cluster\nNetwork trust boundary: cluster network\nBackend receives: http://10.244.2.15:8080"]
+
+    BackendMTLS["mTLS to backend Pod\nGateway presents its own client cert\nBackend verifies gateway identity\nUse case: zero-trust, PCI-DSS, regulated workloads"]
+
+    CertRotate["cert-manager issues new cert\nStores in Secret/gateway-tls\nController WATCHes Secret → pushes new cert\nKong hot-reloads — no dropped connections ✅"]
+
+    Client --> SNI
+    SNI --> CertLookup
+    CertLookup -->|"exact SNI match → cert-A"| Handshake
+    Handshake --> HTTP
+    HTTP --> BackendHTTP
+    HTTP --> BackendMTLS
+    CertRotate -.->|"cert auto-rotation"| CertLookup
+```
+
+---
+
+### 6. Request and Response Transformation — Before vs After
+
+What arrives from the client vs what the backend Pod actually receives, and what the backend sends vs what the client gets back:
+
+```
+REQUEST: Client → Gateway → Backend Pod
+────────────────────────────────────────────────────────────────────
+INBOUND (from client)                   OUTBOUND (to backend)
+────────────────────────────────────────────────────────────────────
+GET /v1/app/users?page=2                GET /app/users?page=2&source=gw
+Host: api.example.com                   Host: user-service
+Authorization: Bearer eyJ...            (removed — gateway strips token)
+X-User-Agent: MobileApp/2.1             X-User-Agent: MobileApp/2.1
+                                        X-User-ID: user-123         ← from JWT sub claim
+                                        X-User-Email: a@example.com ← from JWT email claim
+                                        X-User-Roles: user,premium  ← from JWT roles claim
+                                        X-Request-ID: 7f8d-9e2a     ← generated UUID
+                                        X-Forwarded-For: 203.0.113.50  ← original client IP
+                                        X-Forwarded-Proto: https    ← original scheme
+                                        X-Kong-Request-Start: 1683648000.123
+
+RESPONSE: Backend Pod → Gateway → Client
+────────────────────────────────────────────────────────────────────
+INBOUND (from backend)                  OUTBOUND (to client)
+────────────────────────────────────────────────────────────────────
+HTTP/1.1 200 OK                         HTTP/1.1 200 OK
+Content-Type: application/json          Content-Type: application/json
+Server: Express                         Server: (stripped — don't expose backend tech)
+X-Powered-By: Express                   X-Powered-By: (stripped)
+                                        X-RateLimit-Limit: 100      ← added by rate plugin
+                                        X-RateLimit-Remaining: 54   ← added by rate plugin
+                                        X-Kong-Upstream-Latency: 38 ← ms to backend
+                                        X-Kong-Proxy-Latency: 4     ← ms in gateway
+                                        Access-Control-Allow-Origin: https://app.example.com
+                                        Strict-Transport-Security: max-age=31536000
+                                        X-Request-ID: 7f8d-9e2a     ← echo for client tracing
+```
+
+**Why the gateway strips `Authorization` before forwarding:**  
+The JWT contains the user's identity and scopes. Once the gateway has verified it and injected the claims as `X-User-*` headers, the raw token is no longer needed by the backend — and forwarding it would be a security risk if a backend were ever compromised or misconfigured to log request headers.
+
+**Why the gateway strips `Server` and `X-Powered-By` from responses:**  
+These headers reveal backend technology (`Express`, `nginx/1.18.0`, `Python/3.11`). Removing them at the gateway prevents fingerprinting by attackers without requiring every backend service to configure header removal individually.
+
+---
+
 ## Gateway API (Kubernetes Standard)
 
 **Kubernetes Gateway API** is the next-generation Ingress, standardizing advanced routing.
