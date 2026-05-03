@@ -222,6 +222,171 @@ flowchart TD
     Del --> Watch
 ```
 
+## Request Path: `/v1/app` to Pod — Network Hops Explained
+
+> **Short answer:** The request lands on a **Gateway Pod** (not the Service).  
+> A Kubernetes Service is not a process — it is a set of iptables/IPVS rules programmed by `kube-proxy`.  
+> Every "connection to a Service ClusterIP" is transparently DNAT'd by those rules to a real Pod IP before a single byte is received by any process.
+
+### Full Network Path with Real IPs
+
+```mermaid
+flowchart TD
+    Client["🖥️ Client Browser / Mobile App\nGET https://api.example.com/v1/app\nAuthorization: Bearer <JWT>"]
+
+    DNS["🌐 DNS\napi.example.com\n→ 203.0.113.100"]
+
+    CloudLB["☁️ Cloud Load Balancer\nPublic IP: 203.0.113.100:443\nHealth-checks Gateway Pods every 5s\nSelects healthy backend by round-robin"]
+
+    GWSvc["📋 Kong Gateway Service\ntype: LoadBalancer\nExternal IP: 203.0.113.100\nClusterIP: 10.96.50.10:443\n─────────────────\nNOT a process — just routing rules\nkube-proxy programs DNAT for this IP"]
+
+    KProxy1["⚙️ kube-proxy on node-1\niptables DNAT rule:\n10.96.50.10:443 → 10.244.0.5:8443\n(selected Gateway Pod)"]
+
+    GWPod["🔷 Kong Gateway Pod\nReal IP: 10.244.0.5:8443\n─────────────────\nActual process that handles the request:\n① TLS termination (decrypt HTTPS)\n② Rate Limit plugin — check counter\n③ JWT Auth plugin — verify token\n④ Request Transformer — add X-User-* headers,\n   strip /v1 prefix → /app\n⑤ Route match: /app → app-service\n⑥ Pick endpoint from EndpointSlice"]
+
+    AppSvc["📋 app-service\ntype: ClusterIP\nClusterIP: 10.96.80.100:8080\n─────────────────\nNOT a process — just routing rules\nkube-proxy programs DNAT for this IP"]
+
+    KProxy2["⚙️ kube-proxy on node-2\niptables DNAT rule:\n10.96.80.100:8080 → 10.244.2.15:8080\n(selected backend Pod)"]
+
+    AppPod["🟢 app-service Pod\nReal IP: 10.244.2.15:8080\n─────────────────\nActual process receiving request:\nGET /app HTTP/1.1\nX-User-ID: user-123\nX-User-Roles: premium\nX-Request-ID: uuid\n(Authorization header removed)"]
+
+    DB["🗄️ Database\n10.244.3.50:5432"]
+
+    Client -->|"1 — DNS query"| DNS
+    DNS -->|"2 — returns LB public IP"| Client
+    Client -->|"3 — TCP+TLS to 203.0.113.100:443"| CloudLB
+    CloudLB -->|"4 — forwards to Kong Service\n(still public IP layer)"| GWSvc
+    GWSvc -->|"5 — kube-proxy DNAT\nClusterIP → Pod IP"| KProxy1
+    KProxy1 -->|"6 — packet delivered to\nGateway Pod real IP"| GWPod
+    GWPod -->|"7 — new TCP connection\nto app-service ClusterIP"| AppSvc
+    AppSvc -->|"8 — kube-proxy DNAT\nClusterIP → Pod IP"| KProxy2
+    KProxy2 -->|"9 — packet delivered to\nbackend Pod real IP"| AppPod
+    AppPod -->|"10 — DB query"| DB
+    DB -->|"11 — result"| AppPod
+    AppPod -->|"12 — HTTP 200 JSON"| GWPod
+    GWPod -->|"13 — add latency headers,\nemit metrics, re-encrypt TLS"| CloudLB
+    CloudLB -->|"14 — HTTPS 200 to client"| Client
+```
+
+### The Two DNAT Hops Explained
+
+Every HTTP call in Kubernetes that goes through a Service goes through a DNAT rewrite by `kube-proxy`. This happens **twice** in an API Gateway flow:
+
+```
+Hop 1 — Client → Gateway
+────────────────────────────────────────────────────────────────
+Cloud LB sends TCP to: 203.0.113.100:443         (public IP)
+  ↓  cloud routes to node
+Node receives packet destined for: 10.96.50.10:443 (ClusterIP)
+  ↓  kube-proxy iptables DNAT
+Packet rewritten to:  10.244.0.5:8443             (Kong Pod IP)
+  ↓  routed via CNI overlay to node-1
+Kong Pod process receives the connection ✅
+
+Hop 2 — Gateway → Backend
+────────────────────────────────────────────────────────────────
+Kong opens new TCP to: 10.96.80.100:8080          (ClusterIP)
+  ↓  kube-proxy iptables DNAT (on whichever node Kong is on)
+Packet rewritten to:  10.244.2.15:8080            (app Pod IP)
+  ↓  routed via CNI overlay to node-2
+app-service Pod process receives the connection ✅
+```
+
+> **Key insight:** A Service ClusterIP never appears in `ss -tnp` or `netstat` output inside any Pod.  
+> By the time the packet reaches a network interface, the destination is always a real Pod IP.
+
+### What Each Layer Owns
+
+```mermaid
+flowchart LR
+    subgraph L4["L4 — Transport (TCP)"]
+        direction TB
+        CloudLB2["Cloud LB\nTerminates external TCP\nLoad-balances across nodes"]
+        KProxy3["kube-proxy\nDNATs Service VIPs\nto Pod IPs via iptables/IPVS"]
+    end
+
+    subgraph L7["L7 — Application (HTTP)"]
+        direction TB
+        GWPod2["Kong / Envoy Pod\n• TLS termination\n• Auth + Rate limit\n• Routing decision\n• Header rewrite\n• Observability"]
+        AppPod2["Backend Pod\n• Business logic\n• DB queries\n• Response body"]
+    end
+
+    subgraph Config["Config Plane (Kubernetes API)"]
+        direction TB
+        GWClass2["GatewayClass\nGateway\nHTTPRoute\n→ tell the controller what rules exist"]
+        GWCtrl["Gateway Controller\n→ translates rules into\nnginx.conf / xDS config\n→ pushes to Gateway Pods"]
+        EPSlice["EndpointSlice controller\n→ tracks ready Pod IPs\n→ consumed by kube-proxy\nand Gateway Pods"]
+    end
+
+    Config --> L7
+    Config --> L4
+    L4 --> L7
+```
+
+### Concrete Example: `GET /v1/app` Step by Step
+
+```
+1.  Client:        GET https://api.example.com/v1/app
+                   Authorization: Bearer eyJ...
+
+2.  DNS:           api.example.com → 203.0.113.100
+
+3.  Cloud LB:      Receives TCP:443
+                   Health-checks show kong-pod-1 and kong-pod-2 are healthy
+                   Selects kong-pod-1 (round-robin)
+                   Forwards to node-1 port 31080 (NodePort) or directly via
+                   target group to pod IP
+
+4.  kube-proxy     Sees dst=10.96.50.10:443 (Kong Service ClusterIP)
+    (node-1):      Matches iptables rule:
+                     -A KUBE-SVC-KONG -m statistic --mode random \
+                       -j KUBE-SEP-KONGPOD1   ← 50% chance
+                     -A KUBE-SVC-KONG -j KUBE-SEP-KONGPOD2            ← 50% chance
+                   DNAT: 10.96.50.10:443 → 10.244.0.5:8443
+
+5.  Kong Pod       Receives TLS connection on 10.244.0.5:8443
+    (10.244.0.5):  ① Decrypt TLS
+                   ② Rate Limit: counter=46/100 ✅
+                   ③ JWT Auth:   decode, verify RS256, exp valid ✅
+                   ④ Transform:  strip /v1 → path becomes /app
+                                 add X-User-ID: user-123
+                                 remove Authorization header
+                   ⑤ Route:      host=api.example.com + path=/app
+                                 → matched HTTPRoute rule
+                                 → backend: app-service:8080
+                   ⑥ Endpoint:   reads EndpointSlice
+                                 available: [10.244.2.15, 10.244.2.16, 10.244.3.10]
+                                 selects:   10.244.2.15 (round-robin)
+
+6.  kube-proxy     Kong opens TCP to app-service ClusterIP: 10.96.80.100:8080
+    (node-1):      DNAT: 10.96.80.100:8080 → 10.244.2.15:8080
+
+7.  CNI overlay:   Routes packet from node-1 to node-2 (where 10.244.2.15 lives)
+                   e.g. VXLAN encap → decap on node-2 → delivered to pod veth
+
+8.  app Pod        Receives: GET /app HTTP/1.1
+    (10.244.2.15): Headers:
+                     X-User-ID: user-123
+                     X-User-Roles: premium
+                     X-Request-ID: 7f8d9e2a
+                     X-Forwarded-For: 203.0.113.50
+                   No Authorization header (stripped by gateway) ✅
+                   Process request → DB query → build response
+
+9.  Response       app Pod → kube-proxy (reverse NAT) → Kong Pod
+    path:          Kong adds:
+                     X-Kong-Upstream-Latency: 38
+                     X-Kong-Proxy-Latency: 4
+                     Access-Control-Allow-Origin: https://app.example.com
+                   Kong re-encrypts TLS → Cloud LB → Client
+
+10. Client         HTTP/1.1 200 OK
+    receives:      X-RateLimit-Remaining: 54
+                   X-Request-ID: 7f8d9e2a
+                   { "data": [...] }
+                   Total: ~48ms
+```
+
 ## Gateway API (Kubernetes Standard)
 
 **Kubernetes Gateway API** is the next-generation Ingress, standardizing advanced routing.
