@@ -107,6 +107,121 @@ IoT Device ──────→ IoT BFF Gateway (lightweight, MQTT support)
                    - order-service
 ```
 
+## Kubernetes API Gateway — Architecture Overview
+
+### Component Map: Who Does What
+
+```mermaid
+flowchart LR
+    subgraph Clients["External Clients"]
+        Web[Web App / Browser]
+        Mobile[Mobile App]
+        API[API Consumer]
+    end
+
+    subgraph Edge["Edge Layer"]
+        DNS[DNS\nRoute53 / Cloud DNS]
+        LB[Cloud Load Balancer\nAWS ALB / GCP LB / NLB]
+    end
+
+    subgraph ControlPlane["Kubernetes Control Plane"]
+        APIServer[kube-apiserver]
+        etcd[etcd]
+        GWController[Gateway Controller\ne.g. Kong KIC / Traefik / Envoy]
+    end
+
+    subgraph GatewayConfig["Gateway API Resources"]
+        GWClass[GatewayClass\ndefines implementation]
+        GW[Gateway\nlistener + TLS config]
+        HTTPRoute[HTTPRoute / GRPCRoute\nrouting rules per team]
+    end
+
+    subgraph GatewayPods["Gateway Data Plane (Pods)"]
+        GWPod1[Gateway Pod\nnginx + Lua / Envoy proxy]
+        GWPod2[Gateway Pod\nnginx + Lua / Envoy proxy]
+    end
+
+    subgraph KubeProxy["Node Dataplane"]
+        KProxy[kube-proxy\niptables / IPVS rules]
+    end
+
+    subgraph Services["Backend Services"]
+        SvcA[user-service\nClusterIP]
+        SvcB[order-service\nClusterIP]
+        SvcC[payment-service\nClusterIP]
+    end
+
+    subgraph Pods["Backend Pods"]
+        PodA1[user-pod-1]
+        PodA2[user-pod-2]
+        PodB1[order-pod-1]
+        PodC1[payment-pod-1]
+    end
+
+    Web & Mobile & API --> DNS
+    DNS --> LB
+    LB --> GWPod1 & GWPod2
+
+    GWController -- "LIST/WATCH GatewayClass\nGateway, HTTPRoute" --> APIServer
+    APIServer <--> etcd
+    GatewayConfig -- "stored in" --> APIServer
+    GWController -- "translates rules to\nproxy config (nginx.conf / xDS)" --> GWPod1 & GWPod2
+
+    GWPod1 & GWPod2 -- "route to ClusterIP" --> SvcA & SvcB & SvcC
+    KProxy -- "programs DNAT rules for\nClusterIP → Pod IPs" --> SvcA & SvcB & SvcC
+    SvcA --> PodA1 & PodA2
+    SvcB --> PodB1
+    SvcC --> PodC1
+```
+
+### How Each Component Contributes
+
+| Component | Plane | Role in API Gateway Flow |
+| --- | --- | --- |
+| `GatewayClass` | Config | Names the implementation (e.g. `konghq.com/kic`). Cluster-admin scoped. |
+| `Gateway` | Config | Declares listeners (port 443, TLS cert). Binds to which namespaces can attach routes. |
+| `HTTPRoute` | Config | Team-owned routing rules: host, path, headers, weights, filters. Attached to a Gateway. |
+| Gateway Controller | Control Plane | Watches GatewayClass/Gateway/HTTPRoute. Translates them into proxy config and reloads data plane. |
+| Gateway Pods | Data Plane | The actual reverse-proxy process. Performs authn, rate limiting, routing, TLS termination per request. |
+| `kube-apiserver` | Control Plane | Persists all Gateway API objects. Controller and tools interact only through it. |
+| `etcd` | Control Plane | Stores Gateway API objects durably. Single source of truth. |
+| `kube-proxy` | Node | Programs iptables/IPVS DNAT rules so Service ClusterIPs forward to live Pod IPs. |
+| EndpointSlice controller | Control Plane | Keeps EndpointSlices up to date as Pods start/stop. Gateway and kube-proxy consume these. |
+| Cloud Load Balancer | Edge | Terminates external TCP/HTTPS, distributes across Gateway Pod replicas. |
+
+### Gateway Controller — Reconciliation Loop
+
+The controller is the bridge between Kubernetes config objects and the running proxy process:
+
+```mermaid
+flowchart TD
+    Start([Controller starts]) --> List["LIST GatewayClass\nGateway\nHTTPRoute\nEndpointSlice"]
+    List --> Cache[Populate local\ninformer cache]
+    Cache --> Watch["WATCH for changes\n(long-lived HTTP stream)"]
+    Watch --> Event{Event type?}
+
+    Event -->|GatewayClass created\nor updated| GWC[Validate controllerName\nmatches this controller]
+    GWC --> SetStatus1[PATCH GatewayClass/status\nAccepted=True]
+    SetStatus1 --> Watch
+
+    Event -->|Gateway created\nor updated| GWE[Resolve TLS certs\nfrom Secrets\nValidate listeners]
+    GWE --> SetStatus2[PATCH Gateway/status\nReady=True\nassign external IP]
+    SetStatus2 --> Watch
+
+    Event -->|HTTPRoute created\nor updated| RT[Validate parentRef\nresolves to allowed Gateway\nCheck namespace policy]
+    RT --> Translate[Translate rules to\nproxy config\nnginx.conf / xDS snapshot]
+    Translate --> Reload[Push config to\nGateway Pods\nvia xDS API or ConfigMap]
+    Reload --> SetStatus3[PATCH HTTPRoute/status\nResolvedRefs=True]
+    SetStatus3 --> Watch
+
+    Event -->|EndpointSlice changed| EP[Recompute upstream\nendpoint list]
+    EP --> UpdateLB[Update load balancer\nendpoint table in proxy]
+    UpdateLB --> Watch
+
+    Event -->|HTTPRoute deleted| Del[Remove route from\nproxy config\nReload]
+    Del --> Watch
+```
+
 ## Gateway API (Kubernetes Standard)
 
 **Kubernetes Gateway API** is the next-generation Ingress, standardizing advanced routing.
@@ -582,6 +697,67 @@ resource "aws_apigatewayv2_route" "users" {
 ```
 
 ## Deep Dive: Complete Request Flow (Kong API Gateway)
+
+### End-to-End Request Sequence
+
+```mermaid
+sequenceDiagram
+    actor Client as Client\n(Web / Mobile / API)
+    participant DNS as DNS
+    participant LB as Cloud Load Balancer
+    participant GWPod as Gateway Pod\n(Kong / Envoy)
+    participant RateLimit as Rate Limit Plugin
+    participant JWTAuth as JWT Auth Plugin
+    participant ReqXfm as Request Transformer
+    participant Router as Route Matcher
+    participant KProxy as kube-proxy\n(iptables / IPVS)
+    participant Svc as user-service\n(ClusterIP)
+    participant Pod as user-service Pod
+
+    Client->>DNS: Resolve api.example.com
+    DNS-->>Client: 203.0.113.100 (LB IP)
+    Client->>LB: HTTPS GET /v1/users\nAuthorization: Bearer <JWT>
+    Note over LB: Health-check Gateway Pods\nSelect healthy replica
+    LB->>GWPod: Forward TCP stream\nto Kong pod
+
+    Note over GWPod: TLS termination\nDecrypt HTTPS → HTTP
+
+    GWPod->>RateLimit: Run plugin (priority 901)
+    Note over RateLimit: Check counter for client IP\nin shared memory
+    alt Counter within limit
+        RateLimit-->>GWPod: ✅ Allow — counter=46/100
+    else Limit exceeded
+        RateLimit-->>Client: ❌ 429 Too Many Requests\nRetry-After: 42
+    end
+
+    GWPod->>JWTAuth: Run plugin (priority 1005)
+    Note over JWTAuth: Decode JWT header\nFetch public key from JWKS\nVerify RS256 signature\nValidate exp / nbf claims
+    alt Token valid
+        JWTAuth-->>GWPod: ✅ Authenticated\nsub=user-123, roles=premium
+    else Token invalid / expired
+        JWTAuth-->>Client: ❌ 401 Unauthorized\nWWW-Authenticate: Bearer error=invalid_token
+    end
+
+    GWPod->>ReqXfm: Run plugin (priority 800)
+    Note over ReqXfm: Add headers from JWT claims:\nX-User-ID: user-123\nX-User-Roles: user,premium\nX-Request-ID: uuid\nStrip /v1 prefix from path\nRemove Authorization header
+    ReqXfm-->>GWPod: ✅ Request transformed
+
+    GWPod->>Router: Match route rules
+    Note over Router: Match host: api.example.com ✅\nMatch path: /users ✅\nCheck canary header → none\nSelect: user-service-v1\nWeight LB: pick pod endpoint
+    Router-->>GWPod: Backend: 10.244.2.15:8080
+
+    GWPod->>KProxy: Connect to ClusterIP\n10.96.80.45:8080
+    Note over KProxy: iptables DNAT rule:\nClusterIP:8080 → PodIP:8080\nSelected: 10.244.2.15:8080
+    KProxy->>Pod: Forward HTTP request\n(transformed headers)
+
+    Note over Pod: Extract X-User-ID from header\nQuery database (35ms)\nBuild JSON response
+    Pod-->>KProxy: HTTP 200 OK JSON
+    KProxy-->>GWPod: Response forwarded
+
+    Note over GWPod: Measure upstream latency: 40ms\nAdd CORS headers\nAdd X-Kong-*-Latency headers\nEmit Prometheus metrics\nWrite access log
+    GWPod-->>LB: HTTP 200 OK + headers
+    LB-->>Client: HTTPS 200 OK\nX-RateLimit-Remaining: 54\nX-Request-ID: uuid\nTotal: ~50ms
+```
 
 ### Request Flow: Step-by-Step Breakdown
 
