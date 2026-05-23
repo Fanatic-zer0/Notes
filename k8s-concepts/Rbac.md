@@ -15,6 +15,31 @@ User/Group/ ─→ delete, patch ─→ pods, deployments,
 ServiceAccount     apply             secrets, etc.
 ```
 
+graph LR
+    subgraph "👥 WHO (Subjects)"
+        User["User Account<br>(External Humans/Systems)"]
+        SA["ServiceAccount<br>(Internal Pod Identities)"]
+        Group["Group<br>(Collections of Users)"]
+    end
+
+    subgraph "🔗 LINK (Bindings)"
+        RB1["RoleBinding<br>(Namespaced Scoped)"]
+        RB2["RoleBinding<br>(Namespaced Scoped)"]
+        CRB["ClusterRoleBinding<br>(Cluster-wide Scoped)"]
+    end
+
+    subgraph "📜 WHAT (Roles)"
+        R["Role<br>(Single Namespace)"]
+        CR1["ClusterRole<br>(Scoped to 1 Namespace)"]
+        CR2["ClusterRole<br>(Entire Cluster)"]
+    end
+
+    %% Connections
+    User --> RB1 --> R
+    SA --> RB2 --> CR1
+    Group --> CRB --> CR2
+
+
 ## RBAC Resources
 
 | Resource | Scope | Purpose |
