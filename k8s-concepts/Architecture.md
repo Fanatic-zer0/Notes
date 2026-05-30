@@ -598,12 +598,26 @@ This is how metrics-server and many extension servers integrate without bypassin
 Admission webhook order matters:
 
 1. Built-in mutating admission plugins
-2. `MutatingAdmissionWebhook`
+   `MutatingAdmissionWebhook` (The patcher or Auto-Fixer)
+	This controller is triggered when a request matches the rules in a MutatingWebhookConfiguration. It sends an AdmissionReview object to your external webhook service.
+	- Behavior: It receives the raw object and returns a JSON Patch (operations like add, replace, remove).
+    - The "Serial" Constraint: Because one mutation might affect the next (e.g., Webhook A adds a label, Webhook B checks for that label), mutating webhooks are run sequentially.
+    - Reinvocation Policy: If a webhook makes changes, Kubernetes can optionally re-run other webhooks to ensure the final object is consistent.
+
+	Example: Sidecar Injection
+	- When you deploy a Pod in an Istio-enabled namespace, the Mutating Webhook sees the Pod request and patches the spec.containers list to add the istio-proxy container before the API server even validates the object.      
+
+
 3. Built-in validating admission plugins
-4. `ValidatingAdmissionWebhook`
+  `ValidatingAdmissionWebhook` ( Gatekeeper )
+   This is the final guardrail. It is triggered by a ValidatingWebhookConfiguration. Since it cannot modify the object, these webhooks can run in parallel to reduce latency.
+   - Behavior: It receives the final object (after all mutations and schema checks). It returns a simple Boolean decision.
+   - Drift Prevention: This is strictly for governance. It ensures that no object enters the cluster that violates your corporate or security standards.
+
+  Example: OPA / KyvernoYou want to ban all images from the docker.io registry. The Validating Webhook inspects spec.containers[].image. If it sees docker.io, it returns allowed: false with a message "Use internal registry only."
+
 
 Properties:
-
 - Mutating webhooks may be reinvoked if earlier mutations change later matching conditions.
 - Validating webhooks never modify; they only allow or deny.
 - Failure policy of `Ignore` vs `Fail` changes cluster availability vs policy strictness tradeoffs.
