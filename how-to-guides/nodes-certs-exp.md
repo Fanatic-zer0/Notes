@@ -135,17 +135,232 @@ sudo journalctl -u kubelet --no-pager | grep -i certificate
 
 ## 3. Bottlerocket Nodes
 
-Bottlerocket is commonly used with EKS managed node groups and handles node configuration differently from Amazon Linux.
+## Overview
 
-Recommended actions:
+Bottlerocket nodes in EKS have several certificates that can expire:
+- **kubelet client certificates** - Used for kubelet to authenticate with the API server
+- **Node certificates** - Bootstrap and ongoing authentication
+- **Control plane CA certificates** - Used to verify the control plane
 
-- Prefer Bottlerocket with managed node groups.
-- Use EKS-supported Bottlerocket variants.
-- Update Bottlerocket regularly.
-- Monitor node readiness and kubelet certificate metrics.
-- Replace nodes through managed node group update workflows.
+## Methods to Check Certificate Expiration
 
-For Bottlerocket, avoid assuming Amazon Linux file paths always exist. Use Bottlerocket-supported admin/container access and EKS node group updates for lifecycle operations.
+### 1. Using kubectl (Quick Check)
+
+```bash
+# Check certificate expiration for all nodes
+kubectl get nodes -o json | \
+  jq -r '.items[] | 
+    select(.status.nodeInfo.osImage | contains("Bottlerocket")) | 
+    .metadata.name as $node | 
+    .status.conditions[] | 
+    select(.type=="Ready") | 
+    "\($node): \(.lastHeartbeatTime)"'
+
+# Describe a specific node to check certificate details
+kubectl describe node <node-name> | grep -A5 "Conditions"
+```
+
+### 2. Using AWS Systems Manager Session Manager
+
+Bottlerocket uses a minimal API surface. Access via SSM:
+
+```bash
+# Start SSM session to Bottlerocket node
+aws ssm start-session --target <instance-id>
+
+# Once in the session, enter admin container
+enter-admin-container
+
+# Check kubelet certificate expiration
+sudo openssl x509 -in /var/lib/kubelet/pki/kubelet-client-current.pem \
+  -noout -enddate
+
+# Check CA certificate
+sudo openssl x509 -in /etc/kubernetes/pki/ca.crt \
+  -noout -enddate -subject
+```
+
+### 3. Script to Check All Bottlerocket Nodes
+
+```bash
+#!/bin/bash
+# check-bottlerocket-certs.sh
+
+# Get all Bottlerocket node instance IDs
+INSTANCE_IDS=$(aws ec2 describe-instances \
+  --filters "Name=tag:eks:cluster-name,Values=<your-cluster-name>" \
+            "Name=instance-state-name,Values=running" \
+  --query 'Reservations[*].Instances[?contains(ImageId, `bottlerocket`) == `true`].InstanceId' \
+  --output text)
+
+for INSTANCE_ID in $INSTANCE_IDS; do
+  echo "Checking instance: $INSTANCE_ID"
+  
+  # Execute command via SSM
+  aws ssm send-command \
+    --instance-ids "$INSTANCE_ID" \
+    --document-name "AWS-RunShellScript" \
+    --parameters 'commands=[
+      "apiclient exec admin bash -c \"openssl x509 -in /var/lib/kubelet/pki/kubelet-client-current.pem -noout -enddate -subject\""
+    ]' \
+    --query 'Command.CommandId' \
+    --output text
+done
+```
+
+### 4. Using Kubernetes API Directly
+
+```bash
+# Check certificate expiration via node status
+kubectl get nodes -o json | \
+  jq -r '.items[] | 
+    {
+      name: .metadata.name,
+      os: .status.nodeInfo.osImage,
+      kubelet_version: .status.nodeInfo.kubeletVersion,
+      creation: .metadata.creationTimestamp
+    } | 
+    select(.os | contains("Bottlerocket"))'
+```
+
+### 5. Automated Monitoring with CloudWatch
+
+Create a Lambda function to periodically check:
+
+```python
+# lambda_function.py
+import boto3
+import json
+from datetime import datetime
+import subprocess
+
+def lambda_handler(event, context):
+    ssm = boto3.client('ssm')
+    ec2 = boto3.client('ec2')
+    cloudwatch = boto3.client('cloudwatch')
+    
+    # Find Bottlerocket instances
+    instances = ec2.describe_instances(
+        Filters=[
+            {'Name': 'tag:eks:cluster-name', 'Values': ['your-cluster']},
+            {'Name': 'instance-state-name', 'Values': ['running']}
+        ]
+    )
+    
+    for reservation in instances['Reservations']:
+        for instance in reservation['Instances']:
+            instance_id = instance['InstanceId']
+            
+            # Check certificate via SSM
+            response = ssm.send_command(
+                InstanceIds=[instance_id],
+                DocumentName='AWS-RunShellScript',
+                Parameters={
+                    'commands': [
+                        'apiclient exec admin bash -c "openssl x509 -in /var/lib/kubelet/pki/kubelet-client-current.pem -noout -enddate"'
+                    ]
+                }
+            )
+            
+            # Parse and send to CloudWatch
+            # (Implementation depends on your monitoring needs)
+    
+    return {'statusCode': 200}
+```
+
+### 6. Check Certificate Rotation Status
+
+Bottlerocket automatically rotates certificates, but verify it's working:
+
+```bash
+# In admin container
+sudo journalctl -u kubelet | grep -i certificate
+
+# Check kubelet config for certificate rotation
+apiclient get settings.kubernetes.server-certificate \
+                        settings.kubernetes.cluster-certificate
+```
+
+## Important Notes
+
+### Certificate Auto-Rotation
+- EKS automatically rotates kubelet certificates every ~60 days
+- Bottlerocket kubelet has `--rotate-certificates=true` by default
+- Certificate rotation happens when cert is <30 days from expiration
+
+### Warning Thresholds
+- **Critical**: < 30 days until expiration
+- **Warning**: < 60 days until expiration  
+- **Info**: < 90 days until expiration
+
+### Common Issues
+1. **IAM permissions** - Ensure node IAM role has SSM permissions
+2. **SSM agent** - Verify SSM agent is running on Bottlerocket
+3. **Network connectivity** - Nodes must reach SSM endpoints
+
+### Best Practices
+
+```bash
+# Create a monitoring script
+cat > /usr/local/bin/check-eks-certs.sh << 'EOF'
+#!/bin/bash
+CLUSTER_NAME="your-cluster"
+WARNING_DAYS=60
+
+kubectl get nodes -o json | jq -r '.items[] | 
+  select(.status.nodeInfo.osImage | contains("Bottlerocket")) | 
+  .metadata.name' | while read NODE; do
+  
+  CERT_INFO=$(kubectl get --raw /api/v1/nodes/$NODE/proxy/configz | \
+    jq -r '.kubeletconfig.tlsCertFile')
+  
+  echo "Node: $NODE"
+  echo "Certificate: $CERT_INFO"
+  echo "---"
+done
+EOF
+
+chmod +x /usr/local/bin/check-eks-certs.sh
+
+# Run weekly via cron
+0 0 * * 1 /usr/local/bin/check-eks-certs.sh | mail -s "EKS Cert Check" admin@example.com
+```
+
+## Quick Reference Commands
+
+```bash
+# List all Bottlerocket nodes
+kubectl get nodes -l kubernetes.io/os=linux \
+  -o jsonpath='{.items[*].status.nodeInfo.osImage}' | \
+  grep -o Bottlerocket
+
+# Check kubelet health
+kubectl get --raw /api/v1/nodes/<node-name>/proxy/healthz
+
+# View node conditions
+kubectl get nodes -o custom-columns=\
+NAME:.metadata.name,\
+READY:.status.conditions[?(@.type==\"Ready\")].status,\
+HEARTBEAT:.status.conditions[?(@.type==\"Ready\")].lastHeartbeatTime
+```
+
+## Prerequisites
+
+- AWS CLI configured with appropriate credentials
+- kubectl configured for your EKS cluster
+- jq installed for JSON parsing
+- SSM Session Manager plugin installed
+- Appropriate IAM permissions for SSM and EC2
+
+## Additional Resources
+
+- [Bottlerocket Documentation](https://github.com/bottlerocket-os/bottlerocket)
+- [EKS Certificate Management](https://docs.aws.amazon.com/eks/latest/userguide/cert-management.html)
+- [AWS Systems Manager Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html)
+
+---
+
+
 
 ## 4. EKS Fargate
 
